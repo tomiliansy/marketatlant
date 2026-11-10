@@ -192,14 +192,30 @@ def open_chat(order_id):
     return chat_id
 
 
+def _put_status(campaign, order_id, status):
+    return market("PUT", f"/v2/campaigns/{campaign}/orders/{order_id}/status",
+                  json={"order": {"status": status}})
+
+
 def mark_delivered(order_id):
-    """Сообщаем Маркету, что цифровой товар выдан (способ выдачи CHAT)."""
+    """Сообщаем Маркету, что заказ доставлен.
+
+    Сначала пробуем сразу DELIVERED (так описана выдача цифрового товара через чат).
+    Если Маркет не разрешает такой переход (обычный DBS-заказ должен пройти
+    PROCESSING -> DELIVERY -> DELIVERED), передаём статусы по порядку.
+    """
     rows = db("SELECT campaign_id FROM orders WHERE order_id=?", (order_id,))
     campaign = CAMPAIGN_ID or (rows[0][0] if rows and rows[0][0] else None)
     if not campaign:
         raise RuntimeError("не знаю campaignId магазина: добавьте CAMPAIGN_ID в .env")
-    market("PUT", f"/v2/campaigns/{campaign}/orders/{order_id}/status",
-           json={"order": {"status": "DELIVERED"}})
+    try:
+        _put_status(campaign, order_id, "DELIVERED")
+    except RuntimeError as e:
+        if "STATUS_NOT_ALLOWED" not in str(e):
+            raise
+        log.info("заказ %s: прямой переход в DELIVERED не разрешён, идём по шагам", order_id)
+        _put_status(campaign, order_id, "DELIVERY")
+        _put_status(campaign, order_id, "DELIVERED")
     set_state(order_id, "done")
 
 
@@ -403,7 +419,8 @@ def on_tg_callback(cb):
         except Exception as e:
             log.exception("не удалось отметить заказ доставленным")
             set_buttons(done_button(order_id))
-            answer(f"Не удалось: {e}", alert=True)
+            answer("Не удалось отметить заказ. Подробности - в сообщении ниже.", alert=True)
+            tg_send(f"❌ Заказ №{order_id}: не удалось отметить доставленным.\n{e}")
             return
         set_buttons([])
         answer("Заказ отмечен доставленным")
